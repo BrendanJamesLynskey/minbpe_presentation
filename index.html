@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Let's Build the GPT Tokenizer — Karpathy's minbpe Explained</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/theme/black.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/monokai.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ==================== TITLE ==================== -->
+<section>
+    <h1 class="gradient-text">Let's Build the<br>GPT Tokenizer</h1>
+    <p class="subtitle">A walkthrough of Andrej Karpathy's <em>minbpe</em> —<br>minimal, clean Byte-Pair Encoding for GPT-2 / GPT-4</p>
+    <div class="meta-info">
+        <span>~Few hundred lines of Python</span> · <span>Byte-level BPE</span> · <span>tiktoken-compatible</span>
+    </div>
+    <p class="nav-hint">Use <kbd>→</kbd> to advance · <kbd>↓</kbd> for sub-sections · <kbd>Esc</kbd> for overview</p>
+</section>
+
+<!-- ==================== ROADMAP ==================== -->
+<section>
+    <h2>Roadmap</h2>
+    <div class="roadmap" id="roadmap">
+        <div class="roadmap-item active" data-step="1">
+            <div class="roadmap-icon">❓</div>
+            <div class="roadmap-label">Why Tokenise</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="2">
+            <div class="roadmap-icon">🔡</div>
+            <div class="roadmap-label">Unicode &amp; UTF-8</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="3">
+            <div class="roadmap-icon">🔗</div>
+            <div class="roadmap-label">BPE Algorithm</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="4">
+            <div class="roadmap-icon">⚙️</div>
+            <div class="roadmap-label">BasicTokenizer</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="5">
+            <div class="roadmap-icon">🧩</div>
+            <div class="roadmap-label">Regex &amp; GPT-4</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="6">
+            <div class="roadmap-icon">🏷️</div>
+            <div class="roadmap-label">Special &amp; Compare</div>
+        </div>
+    </div>
+</section>
+
+<!-- ==================== PART 1: WHY TOKENISATION ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 1</h2>
+    <h1 class="gradient-text">Why Tokenisation?</h1>
+    <p>LLMs never see your text — they see tokens</p>
+</section>
+
+<section>
+    <h3>Tokens, not characters</h3>
+    <div class="two-col">
+        <div class="col">
+            <p style="font-size:0.55em; text-align:left;">A language model operates on a sequence of <strong>integer token ids</strong> drawn from a fixed vocabulary. Text must be <em>tokenised</em> on the way in, and token ids <em>de-tokenised</em> back to text on the way out.</p>
+            <div class="explain-box">
+                <p><strong>Tokenisation is a separate, pre-trained stage.</strong> It has its own training set and its own algorithm (BPE), entirely distinct from the neural network.</p>
+                <p>The model's whole world is the token vocabulary — typically ~50K (GPT-2) to ~100K (GPT-4) entries.</p>
+            </div>
+        </div>
+        <div class="col">
+            <div class="text-sample">
+                <div class="text-sample-header">"Tokenization is at the heart of much weirdness in LLMs."</div>
+                <div class="text-sample-body">raw text  →  [tokeniser]  →  token ids
+"hello world"
+   ↓
+[15339, 1917]   (GPT-4 / cl100k_base)
+   ↓
+[transformer]
+   ↓
+next-token logits over the vocab</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section>
+    <h3>Tokenisation is the source of many quirks</h3>
+    <div class="summary-grid">
+        <div class="summary-card">
+            <h4>Can't spell</h4>
+            <ul>
+                <li>Whole words become single tokens</li>
+                <li>The model never sees the letters inside</li>
+                <li>Character-level tasks suffer</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Bad at arithmetic</h4>
+            <ul>
+                <li>Numbers split into odd chunks</li>
+                <li>"677" might be one token, "678" two</li>
+                <li>No consistent digit structure</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Trailing whitespace</h4>
+            <ul>
+                <li>" hello" ≠ "hello"</li>
+                <li>A trailing space changes the tokens</li>
+                <li>Breaks completions in surprising ways</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Non-English penalty</h4>
+            <ul>
+                <li>Rarer scripts → more tokens/char</li>
+                <li>Same meaning, longer sequence</li>
+                <li>More cost, less context budget</li>
+            </ul>
+        </div>
+    </div>
+    <div class="explain-box small">
+        <p><strong>SolidGoldMagikarp:</strong> a Reddit username that appeared in the tokeniser's training data but barely in the model's. It earned its own token whose embedding was essentially never trained — feeding it in produced bizarre, unhinged behaviour. A pure tokenisation artefact.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 2: UNICODE & UTF-8 ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 2</h2>
+    <h1 class="gradient-text">Unicode &amp; UTF-8 Bytes</h1>
+    <p>From abstract code points to a 256-symbol base vocabulary</p>
+</section>
+
+<section>
+    <h3>Code points vs bytes</h3>
+    <pre><code class="language-python"># A Python string is a sequence of Unicode CODE POINTS
+ord("h")      # 104
+ord("👍")     # 128077   (a single code point)
+len("hello")  # 5 code points
+
+# Using code points directly as tokens is a bad base:
+#   - the vocabulary would be ~150,000 (and growing)
+#   - the Unicode standard keeps changing
+# Instead, encode the text to raw UTF-8 BYTES (0..255):
+list("hello".encode("utf-8"))   # [104, 101, 108, 108, 111]
+list("👍".encode("utf-8"))      # [240, 159, 145, 141]  (4 bytes)</code></pre>
+    <div class="explain-box">
+        <p><strong>UTF-8</strong> encodes every Unicode code point into 1–4 bytes. ASCII stays 1 byte; emoji and rarer scripts take more. Crucially, every byte is in <code>0..255</code>.</p>
+        <p><strong>So the base vocabulary is just 256 tokens</strong> — one per possible byte. Small, fixed, universal. BPE then <em>learns</em> new tokens on top of these.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Try it — UTF-8 byte view</h3>
+    <div class="interactive-demo" id="utf8-demo">
+        <label>Type text to see its raw UTF-8 bytes (each box = one base token 0–255):</label>
+        <input type="text" id="utf8-input" value="hi 👍" maxlength="24" spellcheck="false">
+        <div class="byte-table" id="utf8-output"></div>
+        <div class="bpe-stats">
+            <div class="bpe-stat"><span class="bpe-stat-num" id="utf8-chars">0</span><span class="bpe-stat-label">code points</span></div>
+            <div class="bpe-stat"><span class="bpe-stat-num shrink" id="utf8-bytes">0</span><span class="bpe-stat-label">UTF-8 bytes</span></div>
+        </div>
+    </div>
+    <div class="explain-box small">
+        <p>Blue/green = single-byte (ASCII) characters. Amber = multi-byte characters where one code point spans several UTF-8 bytes — exactly why "1 character" is not the same as "1 token".</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 3: THE BPE ALGORITHM ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 3</h2>
+    <h1 class="gradient-text">The BPE Algorithm</h1>
+    <p>Repeatedly merge the most frequent adjacent pair</p>
+</section>
+
+<section>
+    <h3>get_stats — count adjacent pairs</h3>
+    <pre><code class="language-python">def get_stats(ids, counts=None):
+    """
+    Given a list of integers, return a dictionary of counts of consecutive pairs
+    Example: [1, 2, 3, 1, 2] -> {(1, 2): 2, (2, 3): 1, (3, 1): 1}
+    Optionally allows to update an existing dictionary of counts
+    """
+    counts = {} if counts is None else counts
+    for pair in zip(ids, ids[1:]):       # iterate consecutive pairs
+        counts[pair] = counts.get(pair, 0) + 1
+    return counts</code></pre>
+    <div class="explain-box">
+        <p><strong>One pass over the sequence.</strong> <code>zip(ids, ids[1:])</code> yields every consecutive pair; we tally how often each one occurs. The winner is <code>max(stats, key=stats.get)</code> — the most frequent adjacent pair.</p>
+    </div>
+</section>
+
+<section>
+    <h3>merge — replace a pair with a new id</h3>
+    <pre><code class="language-python">def merge(ids, pair, idx):
+    """
+    In the list of integers (ids), replace all consecutive occurrences
+    of pair with the new integer token idx
+    Example: ids=[1, 2, 3, 1, 2], pair=(1, 2), idx=4 -> [4, 3, 4]
+    """
+    newids = []
+    i = 0
+    while i < len(ids):
+        # if not at the very last position AND the pair matches, replace it
+        if ids[i] == pair[0] and i < len(ids) - 1 and ids[i+1] == pair[1]:
+            newids.append(idx)
+            i += 2
+        else:
+            newids.append(ids[i])
+            i += 1
+    return newids</code></pre>
+    <div class="explain-box small">
+        <p>New ids start at <strong>256</strong> (just above the byte range) and increment: 256, 257, 258, … Each merge shrinks the sequence and grows the vocabulary by one.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Worked example — "aaabdaaabac", 3 merges</h3>
+    <div class="worked-example">
+        <div class="we-row">
+            <span class="we-label">start (bytes):</span>
+            <span class="we-seq"><span class="we-cell">a</span><span class="we-cell">a</span><span class="we-cell">a</span><span class="we-cell">b</span><span class="we-cell">d</span><span class="we-cell">a</span><span class="we-cell">a</span><span class="we-cell">a</span><span class="we-cell">b</span><span class="we-cell">a</span><span class="we-cell">c</span></span>
+        </div>
+        <div class="we-row">
+            <span class="we-label">merge aa→Z (256):</span>
+            <span class="we-seq"><span class="we-cell new">Z</span><span class="we-cell">a</span><span class="we-cell">b</span><span class="we-cell">d</span><span class="we-cell new">Z</span><span class="we-cell">a</span><span class="we-cell">b</span><span class="we-cell">a</span><span class="we-cell">c</span></span>
+        </div>
+        <div class="we-row">
+            <span class="we-label">merge ab→Y (257):</span>
+            <span class="we-seq"><span class="we-cell">Z</span><span class="we-cell new">Y</span><span class="we-cell">d</span><span class="we-cell">Z</span><span class="we-cell new">Y</span><span class="we-cell">a</span><span class="we-cell">c</span></span>
+        </div>
+        <div class="we-row">
+            <span class="we-label">merge ZY→X (258):</span>
+            <span class="we-seq"><span class="we-cell new">X</span><span class="we-cell">d</span><span class="we-cell new">X</span><span class="we-cell">a</span><span class="we-cell">c</span></span>
+        </div>
+    </div>
+    <div class="explain-box small">
+        <p>From the README: result is <code>"XdXac"</code> where <code>X=ZY</code>, <code>Y=ab</code>, <code>Z=aa</code>. With minbpe's 256 byte tokens allocated first, the final ids are <code>[258, 100, 258, 97, 99]</code> — 11 bytes compressed to 5 tokens.</p>
+    </div>
+</section>
+
+<section>
+    <h3>merges &amp; vocab — the two learned tables</h3>
+    <pre><code class="language-python"># 'merges' records, in learned order, which pair maps to which new id
+merges = { (97, 97): 256,      # aa -> Z
+           (97, 98): 257,      # ab -> Y
+           (256, 257): 258 }   # ZY -> X
+
+# 'vocab' maps every id back to the raw BYTES it expands to
+def _build_vocab(self):
+    vocab = {idx: bytes([idx]) for idx in range(256)}      # 256 base bytes
+    for (p0, p1), idx in self.merges.items():
+        vocab[idx] = vocab[p0] + vocab[p1]                 # concat children
+    for special, idx in self.special_tokens.items():
+        vocab[idx] = special.encode("utf-8")
+    return vocab</code></pre>
+    <div class="explain-box small">
+        <p><strong>merges</strong> drives <em>encoding</em> (text → ids); <strong>vocab</strong> drives <em>decoding</em> (ids → bytes → text). Note merges is ordered: the order is the priority used at encode time.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 4: BASICTOKENIZER ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 4</h2>
+    <h1 class="gradient-text">BasicTokenizer</h1>
+    <p>train / encode / decode, straight over raw bytes</p>
+</section>
+
+<section>
+    <h3>train — learn the merges</h3>
+    <pre><code class="language-python">def train(self, text, vocab_size, verbose=False):
+    assert vocab_size >= 256
+    num_merges = vocab_size - 256
+
+    text_bytes = text.encode("utf-8")   # raw bytes
+    ids = list(text_bytes)              # list of ints 0..255
+
+    merges = {}                                       # (int,int) -> int
+    vocab = {idx: bytes([idx]) for idx in range(256)} # int -> bytes
+    for i in range(num_merges):
+        stats = get_stats(ids)                # count pairs
+        pair = max(stats, key=stats.get)      # most frequent pair
+        idx = 256 + i                         # mint a new id
+        ids = merge(ids, pair, idx)           # apply it everywhere
+        merges[pair] = idx
+        vocab[idx] = vocab[pair[0]] + vocab[pair[1]]
+    self.merges = merges   # used in encode()
+    self.vocab = vocab     # used in decode()</code></pre>
+</section>
+
+<section>
+    <h3>encode — replay merges in learned order</h3>
+    <pre><code class="language-python">def encode(self, text):
+    text_bytes = text.encode("utf-8")
+    ids = list(text_bytes)
+    while len(ids) >= 2:
+        stats = get_stats(ids)
+        # pick the pair with the LOWEST merge index (earliest learned)
+        pair = min(stats, key=lambda p: self.merges.get(p, float("inf")))
+        if pair not in self.merges:
+            break          # nothing left that we know how to merge
+        idx = self.merges[pair]
+        ids = merge(ids, pair, idx)
+    return ids</code></pre>
+    <div class="explain-box">
+        <p><strong>Why lowest index first?</strong> Merges are hierarchical — later tokens are built from earlier ones (e.g. <code>ZY</code> needs <code>Z</code> and <code>Y</code> to exist first). Replaying in learned order reconstructs exactly the same tokens the trainer would.</p>
+    </div>
+</section>
+
+<section>
+    <h3>decode — ids back to text</h3>
+    <pre><code class="language-python">def decode(self, ids):
+    # look up each id's raw bytes, concatenate
+    text_bytes = b"".join(self.vocab[idx] for idx in ids)
+    # then decode the bytes as UTF-8
+    text = text_bytes.decode("utf-8", errors="replace")
+    return text</code></pre>
+    <div class="explain-box">
+        <p><strong><code>errors="replace"</code> is essential.</strong> An arbitrary list of token ids can produce a byte sequence that is <em>not</em> valid UTF-8 (e.g. a lone continuation byte). Without it, decode would crash; with it, the invalid bytes become the replacement character &#xFFFD;.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Interactive: live BPE tokeniser</h3>
+    <div class="interactive-demo" id="bpe-demo">
+        <label>Type text — it is encoded to UTF-8 bytes, then greedy BPE merges are learned &amp; applied:</label>
+        <input type="text" id="bpe-input" value="aaabdaaabac" maxlength="48" spellcheck="false">
+        <div class="bpe-controls">
+            <span>merges:</span>
+            <input type="range" id="bpe-merges" min="0" max="20" value="3">
+            <span class="merge-count" id="bpe-merges-val">3</span>
+        </div>
+        <div class="bpe-token-display" id="bpe-output"></div>
+        <div class="bpe-stats">
+            <div class="bpe-stat"><span class="bpe-stat-num" id="bpe-bytes">0</span><span class="bpe-stat-label">UTF-8 bytes</span></div>
+            <div class="bpe-stat"><span class="bpe-stat-num shrink" id="bpe-tokens">0</span><span class="bpe-stat-label">tokens after merges</span></div>
+            <div class="bpe-stat"><span class="bpe-stat-num" id="bpe-ratio">1.0×</span><span class="bpe-stat-label">compression</span></div>
+        </div>
+        <div class="merge-log" id="bpe-log"></div>
+    </div>
+    <div class="explain-box small">
+        <p>This runs the real algorithm in your browser: <code>TextEncoder</code> → bytes → <code>get_stats</code> → <code>max</code> pair → <code>merge</code>, repeated. Amber/purple chips are learned merge tokens (id ≥ 256); grey chips are raw bytes.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 5: REGEX & GPT-2/4 ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 5</h2>
+    <h1 class="gradient-text">RegexTokenizer &amp; GPT-2/4</h1>
+    <p>Split first, so merges never cross category boundaries</p>
+</section>
+
+<section>
+    <h3>The problem with naïve BPE</h3>
+    <div class="explain-box">
+        <p>Plain byte-BPE will happily merge across word/punctuation/space boundaries — producing tokens like <code>"dog."</code>, <code>"dog!"</code>, <code>"dog?"</code> as distinct units, and gluing common words to following spaces in inconsistent ways. This wastes vocabulary and hurts generalisation.</p>
+    </div>
+    <p style="font-size:0.5em;">GPT-2's fix: <strong>split the text into chunks with a regex first</strong>, run BPE independently within each chunk, then concatenate. Merges can never reach across a chunk boundary.</p>
+    <div class="regex-chunks">
+        <span class="regex-chunk letters">Hello</span>
+        <span class="regex-chunk space"> </span>
+        <span class="regex-chunk letters">world</span>
+        <span class="regex-chunk numbers">123</span>
+        <span class="regex-chunk punct">!!!</span>
+        <span class="regex-chunk space"> </span>
+        <span class="regex-chunk punct">?</span>
+    </div>
+    <p style="font-size:0.42em; color:var(--text-muted); margin-top:0.5em;">letters · numbers · punctuation · whitespace — kept in separate chunks before BPE</p>
+</section>
+
+<section>
+    <h3>The GPT-2 &amp; GPT-4 split patterns</h3>
+    <pre><code class="language-python"># GPT-2 (from the released code)
+GPT2_SPLIT_PATTERN = \
+  r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+# GPT-4 / cl100k_base (note: case-insensitive contractions, digits capped at 3)
+GPT4_SPLIT_PATTERN = \
+  r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""</code></pre>
+    <div class="explain-box small">
+        <p>Both use the <code>regex</code> module (not <code>re</code>) for Unicode classes <code>\p{L}</code> (letters), <code>\p{N}</code> (numbers). GPT-4 made digits group in runs of at most 3 (<code>\p{N}{1,3}</code>) and made contractions case-insensitive — small but consequential changes.</p>
+    </div>
+</section>
+
+<section>
+    <h3>encode_ordinary — per-chunk BPE</h3>
+    <pre><code class="language-python">def encode_ordinary(self, text):
+    """Encoding that ignores any special tokens."""
+    # split the text up into chunks by the compiled regex pattern
+    text_chunks = re.findall(self.compiled_pattern, text)
+    ids = []
+    for chunk in text_chunks:
+        chunk_bytes = chunk.encode("utf-8")   # each chunk → its own bytes
+        chunk_ids = self._encode_chunk(chunk_bytes)  # BPE within the chunk
+        ids.extend(chunk_ids)
+    return ids</code></pre>
+    <div class="explain-box small">
+        <p><code>train()</code> mirrors this: it computes <code>get_stats</code> per chunk (accumulating into one shared dict), then merges across <em>all</em> chunks — but a merged pair can only ever come from <em>within</em> a single chunk.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Reproducing GPT-4 via tiktoken</h3>
+    <pre><code class="language-python">import tiktoken
+enc = tiktoken.get_encoding("cl100k_base")   # the GPT-4 tokeniser
+
+# minbpe's GPT4Tokenizer wraps RegexTokenizer and loads cl100k's merges.
+# It matches tiktoken exactly, even on tricky multilingual / emoji input:
+text = "hello123!!!? (안녕하세요!) 😉"
+# RegexTokenizer(GPT-4)  ==  tiktoken.cl100k_base   ✓ identical ids</code></pre>
+    <div class="explain-box">
+        <p><strong>Recovering the merges:</strong> tiktoken ships only the final <code>{bytes: rank}</code> table, not the ordered merge list. minbpe reconstructs the merge order with a small <code>recover_merges()</code> / <code>bpe()</code> routine — for each token, find the pair of lower-rank tokens that compose it, in rank order.</p>
+        <p><strong>The byte-shuffle permutation:</strong> GPT-4 applies an "unfortunate (and likely historical?)" 1-byte permutation — the 256 base byte tokens are shuffled before BPE. minbpe recovers this permutation so the single-byte tokens line up with tiktoken's.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 6: SPECIAL TOKENS & COMPARISON ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 6</h2>
+    <h1 class="gradient-text">Special Tokens &amp; Comparison</h1>
+    <p>Control tokens, and BPE-on-bytes vs BPE-on-code-points</p>
+</section>
+
+<section>
+    <h3>Registering special tokens</h3>
+    <pre><code class="language-python"># Special tokens live OUTSIDE the byte/merge range, with explicit ids.
+# Example from GPT-2: a single end-of-text marker at id 50256.
+special_tokens = { "&lt;|endoftext|&gt;": 50256 }
+tokenizer.register_special_tokens(special_tokens)
+
+# encode() must be told what to do with them, for safety:
+tokenizer.encode(text, allowed_special="all")        # honour them
+tokenizer.encode(text, allowed_special="none")       # treat as plain text
+tokenizer.encode(text, allowed_special="none_raise") # raise if present</code></pre>
+    <div class="explain-box small">
+        <p>GPT-4 adds more: <span class="special-pill">&lt;|endoftext|&gt;</span> <span class="special-pill">&lt;|fim_prefix|&gt;</span> <span class="special-pill">&lt;|fim_middle|&gt;</span> <span class="special-pill">&lt;|fim_suffix|&gt;</span> <span class="special-pill">&lt;|endofprompt|&gt;</span> — used for document boundaries and fill-in-the-middle. They are isolated by string splitting <em>before</em> BPE, never learned as merges.</p>
+    </div>
+</section>
+
+<section>
+    <h3>sentencepiece (Llama) vs tiktoken (GPT)</h3>
+    <div class="comparison-table">
+        <table>
+            <thead>
+                <tr><th></th><th>tiktoken / minbpe (GPT)</th><th>sentencepiece (Llama)</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>BPE operates on</td><td>raw UTF-8 bytes</td><td>Unicode code points</td></tr>
+                <tr><td>Rare characters</td><td>always representable (bytes)</td><td><code>byte_fallback</code> to bytes</td></tr>
+                <tr><td>Order of ops</td><td>encode → bytes → BPE</td><td>BPE on code points first</td></tr>
+                <tr><td>Used by</td><td>GPT-2, GPT-3.5, GPT-4</td><td>Llama, Mistral</td></tr>
+                <tr><td>Config</td><td>minimal</td><td>many knobs (historical)</td></tr>
+            </tbody>
+        </table>
+        <p class="table-note">Both are BPE. The key split is <em>what symbols BPE merges</em>: bytes (tiktoken) vs code points with a byte fallback for the unknown (sentencepiece).</p>
+    </div>
+</section>
+
+<section>
+    <h3>Practical tokeniser pitfalls</h3>
+    <div class="takeaways">
+        <div class="takeaway">
+            <span class="takeaway-num">!</span>
+            <p><strong>Whitespace &amp; punctuation matter.</strong> A leading/trailing space, or punctuation glued to a word, changes the token ids — and therefore the model's behaviour and your token bill.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">!</span>
+            <p><strong>Never trust untrusted special tokens.</strong> Use <code>allowed_special</code> deliberately; an attacker who can inject <code>&lt;|endoftext|&gt;</code> can fracture your prompt structure.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">!</span>
+            <p><strong>Non-English costs more.</strong> Scripts under-represented in the merge training set tokenise into more, shorter tokens — inflating cost and shrinking effective context.</p>
+        </div>
+    </div>
+</section>
+</section>
+
+<!-- ==================== SUMMARY ==================== -->
+<section>
+<section>
+    <h2 class="gradient-text">minbpe at a Glance</h2>
+    <div class="summary-grid">
+        <div class="summary-card">
+            <h4>Core primitives</h4>
+            <ul>
+                <li>get_stats — count pairs</li>
+                <li>merge — replace a pair</li>
+                <li>merges dict (encode)</li>
+                <li>vocab dict (decode)</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>BasicTokenizer</h4>
+            <ul>
+                <li>BPE over raw bytes</li>
+                <li>train / encode / decode</li>
+                <li>lowest-index merge first</li>
+                <li>errors='replace' on decode</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>RegexTokenizer</h4>
+            <ul>
+                <li>GPT-2 / GPT-4 split regex</li>
+                <li>per-chunk BPE</li>
+                <li>no cross-category merges</li>
+                <li>special-token support</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>GPT4Tokenizer</h4>
+            <ul>
+                <li>loads cl100k_base merges</li>
+                <li>recovers merge order</li>
+                <li>recovers byte permutation</li>
+                <li>matches tiktoken exactly</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<section>
+    <h2>Where this fits in Zero-to-Hero</h2>
+    <div class="comparison-table">
+        <table>
+            <thead>
+                <tr><th>Lecture</th><th>Builds</th><th>Tokeniser used</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>makemore</td><td>bigram → MLP → WaveNet</td><td>character-level</td></tr>
+                <tr><td>nanoGPT</td><td>a GPT from scratch</td><td>character-level (65 vocab)</td></tr>
+                <tr><td>minbpe</td><td>the GPT tokeniser</td><td>byte-level BPE (this deck)</td></tr>
+            </tbody>
+        </table>
+        <p class="table-note">nanoGPT used a toy character tokeniser to keep focus on the Transformer. minbpe fills the gap — it is the real, production-style tokeniser that sits in front of a model like GPT-2/4.</p>
+    </div>
+    <div class="explain-box small">
+        <p>Karpathy's <strong>Neural Networks: Zero to Hero</strong> series builds intuition bottom-up. Tokenisation is the bridge between human text and the integer sequences every earlier lecture assumed already existed.</p>
+    </div>
+</section>
+
+<section>
+    <h2>Key Takeaways</h2>
+    <div class="takeaways">
+        <div class="takeaway">
+            <span class="takeaway-num">1</span>
+            <p><strong>LLMs see tokens, not text.</strong> Tokenisation is a separate, BPE-trained stage — and the root cause of spelling, arithmetic, whitespace and multilingual quirks.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">2</span>
+            <p><strong>BPE is two functions.</strong> Count adjacent pairs (<code>get_stats</code>), merge the most frequent one (<code>merge</code>) into a new id, repeat. Bytes (0–255) are the universal base vocabulary.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">3</span>
+            <p><strong>Regex splitting + byte BPE = GPT.</strong> Add a category-aware split and special tokens and you reproduce GPT-4's tiktoken tokeniser exactly — in a few hundred clean lines.</p>
+        </div>
+    </div>
+    <div class="credits">
+        <p>Based on Andrej Karpathy's <a href="https://www.youtube.com/watch?v=zduSFxRajkE" target="_blank">"Let's build the GPT Tokenizer"</a></p>
+        <p>Code: <a href="https://github.com/karpathy/minbpe" target="_blank">github.com/karpathy/minbpe</a></p>
+    </div>
+</section>
+</section>
+
+</div><!-- /slides -->
+</div><!-- /reveal -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/plugin/highlight/highlight.min.js"></script>
+<script src="interactive.js"></script>
+<script>
+Reveal.initialize({
+    hash: true,
+    slideNumber: true,
+    transition: 'slide',
+    backgroundTransition: 'fade',
+    plugins: [ RevealHighlight ],
+    width: 1200,
+    height: 700,
+    margin: 0.04,
+});
+</script>
+</body>
+</html>
